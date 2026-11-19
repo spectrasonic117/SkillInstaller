@@ -1,0 +1,513 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+             ⚡ AGENTS SKILLS INSTALLER & SYNC CLI ⚡
+=============================================================================
+Herramienta CLI interactiva para gestionar e instalar skills desde el
+almacén global (~/Documents/Skills) hacia el proyecto actual (.agents/skills).
+
+Características:
+- Navegación visual con flechas (↑ / ↓)
+- Selección toggle con barra espaciadora (<ESPACIO>)
+- Confirmación e instalación con <ENTER>
+- Selección rápida: [a] todas, [i] invertir selección
+- Lectura automática de metadatos (SKILL.md, .metadata.json, README.md)
+- Detección de skills ya existentes en el proyecto local
+- Interfaz moderna, colorida y detallada construida con Rich y Questionary
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+# Verificación de dependencias con mensajes amigables
+try:
+    from rich import box
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.theme import Theme
+except ImportError:
+    print("Error: La librería 'rich' no está instalada.")
+    print("Instálala ejecutando: pip install rich")
+    sys.exit(1)
+
+try:
+    import questionary
+    from prompt_toolkit.styles import Style
+except ImportError:
+    print("Error: La librería 'questionary' no está instalada.")
+    print("Instálala ejecutando: pip install questionary")
+    sys.exit(1)
+
+# -----------------------------------------------------------------------------
+# Rutas por defecto
+# -----------------------------------------------------------------------------
+# Almacén global de skills: ~/Documents/Skills  (o $HOME/Documents/Skills)
+DEFAULT_SOURCE_DIR = Path.home() / "Documents" / "Skills"
+
+
+def resolve_path(raw: str | Path) -> Path:
+    """Resuelve una ruta admitiendo ~, $HOME y ${HOME}."""
+    expanded = os.path.expandvars(str(raw))
+    return Path(expanded).expanduser().resolve()
+
+
+# -----------------------------------------------------------------------------
+# Configuración y temas visuales
+# -----------------------------------------------------------------------------
+custom_theme = Theme({
+    "info": "cyan",
+    "warning": "yellow",
+    "error": "bold red",
+    "success": "bold green",
+    "accent": "bold magenta",
+    "muted": "dim white",
+})
+
+console = Console(theme=custom_theme)
+
+# Estilo para questionary (tema oscuro moderno / cyberpunk / catppuccin)
+QUESTIONARY_STYLE = Style([
+    ("qmark", "fg:#00ffff bold"),          # Signo de interrogación / prompt
+    ("question", "fg:#ffffff bold"),       # Pregunta principal
+    ("answer", "fg:#50fa7b bold"),         # Respuesta confirmada
+    ("pointer", "fg:#ff79c6 bold"),        # Flecha indicadora (cursor)
+    ("highlighted", "fg:#ff79c6 bold"),    # Opción enfocada
+    ("selected", "fg:#50fa7b bold"),       # Elemento marcado [X]
+    ("separator", "fg:#6272a4"),           # Separadores
+    ("instruction", "fg:#8be9fd italic"),  # Instrucciones auxiliares
+    ("text", "fg:#f8f8f2"),                # Texto normal
+    ("disabled", "fg:#6272a4 italic"),     # Deshabilitados
+])
+
+
+# -----------------------------------------------------------------------------
+# Estructuras de datos
+# -----------------------------------------------------------------------------
+@dataclass
+class SkillItem:
+    folder_name: str
+    source_path: Path
+    display_name: str
+    description: str
+    is_installed: bool = False
+    files_count: int = 0
+    total_size_bytes: int = 0
+
+    @property
+    def formatted_size(self) -> str:
+        """Devuelve el tamaño formateado en B, KB o MB."""
+        size = self.total_size_bytes
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}" if unit != "B" else f"{size} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+
+# -----------------------------------------------------------------------------
+# Extracción de información y metadatos
+# -----------------------------------------------------------------------------
+def inspect_skill_folder(folder: Path, target_dir: Path) -> SkillItem:
+    """Analiza una carpeta de skill y extrae metadatos y estadísticas."""
+    folder_name = folder.name
+    display_name = folder_name
+    description = ""
+
+    # 1. Intentar extraer de SKILL.md (formato frontmatter YAML)
+    skill_md = folder / "SKILL.md"
+    if skill_md.is_file():
+        try:
+            content = skill_md.read_text(encoding="utf-8", errors="ignore")
+            # Extraer description
+            m_desc = re.search(r"^description:\s*(?:>-\s*|[\"'])?\s*(.+)$", content, re.MULTILINE)
+            if m_desc:
+                description = m_desc.group(1).strip("\"' ")
+            # Extraer name
+            m_name = re.search(r"^name:\s*[\"']?([^\"'\n]+)[\"']?", content, re.MULTILINE)
+            if m_name:
+                display_name = m_name.group(1).strip()
+        except Exception:
+            pass
+
+    # 2. Si no hay descripción, revisar .metadata.json
+    meta_json = folder / ".metadata.json"
+    if not description and meta_json.is_file():
+        try:
+            data = json.loads(meta_json.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(data, dict):
+                display_name = data.get("name", display_name)
+                description = data.get("description", description)
+        except Exception:
+            pass
+
+    # 3. Si aún no hay descripción, revisar README.md
+    readme = folder / "README.md"
+    if not description and readme.is_file():
+        try:
+            lines = readme.read_text(encoding="utf-8", errors="ignore").splitlines()
+            for line in lines:
+                cleaned = line.strip()
+                if cleaned and not cleaned.startswith("#") and not cleaned.startswith("```"):
+                    description = cleaned
+                    break
+        except Exception:
+            pass
+
+    if not description:
+        description = "Sin descripción disponible."
+
+    # Contar archivos y tamaño total
+    files_count = 0
+    total_size = 0
+    try:
+        for p in folder.rglob("*"):
+            if p.is_file() and not p.name.startswith("."):
+                files_count += 1
+                total_size += p.stat().st_size
+    except Exception:
+        pass
+
+    # Comprobar si ya existe en el directorio de destino
+    dest_path = target_dir / folder_name
+    is_installed = dest_path.is_dir() and any(dest_path.iterdir())
+
+    return SkillItem(
+        folder_name=folder_name,
+        source_path=folder,
+        display_name=display_name,
+        description=description,
+        is_installed=is_installed,
+        files_count=files_count,
+        total_size_bytes=total_size,
+    )
+
+
+def load_skills(source_dir: Path, target_dir: Path) -> List[SkillItem]:
+    """Carga y ordena todas las skills encontradas en el directorio origen."""
+    if not source_dir.exists():
+        return []
+
+    skills: List[SkillItem] = []
+    for entry in sorted(source_dir.iterdir(), key=lambda p: p.name.lower()):
+        # Ignorar archivos sueltos y carpetas ocultas/especiales
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        if entry.name.lower() in ("__pycache__", ".git", "node_modules"):
+            continue
+        
+        skills.append(inspect_skill_folder(entry, target_dir))
+
+    return skills
+
+
+# -----------------------------------------------------------------------------
+# Componentes visuales Rich
+# -----------------------------------------------------------------------------
+def render_header(source_dir: Path, target_dir: Path, total_skills: int, installed_count: int) -> None:
+    """Muestra el banner de bienvenida y la información de contexto."""
+    console.clear()
+    
+    title_text = Text("⚡ AUTO-SKILLS MANAGER ⚡", style="bold cyan")
+    subtitle_text = Text("Sincroniza skills globales a tu proyecto actual", style="italic white")
+
+    info_table = Table.grid(padding=(0, 2))
+    info_table.add_column(style="bold yellow", justify="right")
+    info_table.add_column(style="white")
+
+    info_table.add_row("📂 Almacén Global:", f"[cyan]{source_dir}[/cyan]")
+    info_table.add_row("🎯 Destino Proyecto:", f"[green]{target_dir}[/green]")
+    info_table.add_row(
+        "📊 Estadísticas:",
+        f"[bold cyan]{total_skills}[/bold cyan] skills disponibles  ·  "
+        f"[bold green]{installed_count}[/bold green] ya en este proyecto"
+    )
+
+    content = Table.grid(padding=(0, 1))
+    content.add_row(title_text)
+    content.add_row(subtitle_text)
+    content.add_row("")
+    content.add_row(info_table)
+
+    header_panel = Panel(
+        content,
+        box=box.ROUNDED,
+        border_style="cyan",
+        padding=(1, 2),
+    )
+    console.print(header_panel)
+    console.print()
+
+
+def show_skills_table(skills: List[SkillItem]) -> None:
+    """Muestra una tabla con todas las skills disponibles."""
+    table = Table(
+        title="✨ Catálogo de Skills Globales ✨",
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        border_style="dim blue",
+        expand=True,
+    )
+    table.add_column("Estado", justify="center", width=14)
+    table.add_column("Carpeta / Skill", style="bold green", width=26)
+    table.add_column("Archivos", justify="right", width=10)
+    table.add_column("Tamaño", justify="right", width=10)
+    table.add_column("Descripción", style="dim white", max_width=38, no_wrap=True, width=38)
+
+    def _shorten(text: str, limit: int) -> str:
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    for s in skills:
+        status_text = "[bold green]✔ Instalada[/bold green]" if s.is_installed else "[dim]—[/dim]"
+        table.add_row(
+            status_text,
+            s.folder_name,
+            f"{s.files_count}",
+            s.formatted_size,
+            _shorten(s.description, 38),
+        )
+
+    console.print(table)
+
+
+# -----------------------------------------------------------------------------
+# Operación de copia e instalación
+# -----------------------------------------------------------------------------
+def copy_skills(selected_skills: List[SkillItem], target_dir: Path) -> None:
+    """Copia las skills seleccionadas a la carpeta .agents/skills/ del proyecto."""
+    if not selected_skills:
+        console.print("[warning]⚠ No seleccionaste ninguna skill. No se realizó ningún cambio.[/warning]")
+        return
+
+    # Crear directorio si no existe
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    results: List[Tuple[SkillItem, str, str]] = []  # (skill, status, detail)
+
+    with console.status("[bold green]Copiando skills seleccionadas a .agents/skills/...[/bold green]", spinner="dots"):
+        for skill in selected_skills:
+            dest = target_dir / skill.folder_name
+            was_installed = skill.is_installed
+
+            try:
+                # Copiar recursivamente permitiendo sobreescritura limpia
+                shutil.copytree(skill.source_path, dest, dirs_exist_ok=True)
+                
+                # Contar archivos copiados
+                copied_files = sum(1 for p in dest.rglob("*") if p.is_file())
+                status = "🔄 Actualizada" if was_installed else "✔ Instalada"
+                results.append((skill, status, f"{copied_files} archivos listos"))
+            except Exception as e:
+                results.append((skill, "✘ Falló", str(e)))
+
+    # Mostrar tabla de resultados
+    console.print()
+    result_table = Table(
+        title="📋 Resumen de Instalación",
+        box=box.ROUNDED,
+        header_style="bold magenta",
+        border_style="magenta",
+        expand=True,
+    )
+    result_table.add_column("Resultado", justify="center", width=16)
+    result_table.add_column("Skill", style="bold cyan", width=26)
+    result_table.add_column("Ubicación", style="dim", width=40)
+    result_table.add_column("Detalle", style="white")
+
+    success_count = 0
+    for skill, status, detail in results:
+        dest_display = str(target_dir / skill.folder_name)
+        if "✔" in status or "🔄" in status:
+            success_count += 1
+            st_style = "bold green" if "✔" in status else "bold yellow"
+        else:
+            st_style = "bold red"
+
+        result_table.add_row(
+            f"[{st_style}]{status}[/{st_style}]",
+            skill.folder_name,
+            dest_display,
+            detail,
+        )
+
+    console.print(result_table)
+    console.print()
+
+    # Panel final de felicitación
+    summary_panel = Panel(
+        Text.from_markup(
+            f"[bold green]✨ ¡Listo! Se han procesado con éxito {success_count} de {len(selected_skills)} skills.[/bold green]\n"
+            f"[dim]Tus agentes de IA ahora pueden utilizar estas herramientas desde [cyan]{target_dir}[/cyan][/dim]"
+        ),
+        box=box.ROUNDED,
+        border_style="green",
+        padding=(1, 2),
+    )
+    console.print(summary_panel)
+
+
+# -----------------------------------------------------------------------------
+# Flujo interactivo con Questionary
+# -----------------------------------------------------------------------------
+def prompt_interactive_selection(skills: List[SkillItem]) -> List[SkillItem]:
+    """Presenta el menú con checkboxes (espacio para toggle, enter para confirmar)."""
+    if not skills:
+        return []
+
+    # Construir las opciones para el checkbox
+    choices = []
+    for skill in skills:
+        badge = " [Ya en proyecto]" if skill.is_installed else ""
+        short_desc = ""
+        if skill.description:
+            d = skill.description[:52]
+            short_desc = f" - {d}{'...' if len(skill.description) > 52 else ''}"
+        title = f"{skill.folder_name:<24}{badge:<18}{short_desc}"
+        
+        choices.append(
+            questionary.Choice(
+                title=title,
+                value=skill,
+                checked=skill.is_installed,  # Preseleccionar si ya está instalada o deseada
+            )
+        )
+
+    console.print(
+        "[bold yellow]Controles:[/bold yellow] [cyan]↑/↓[/cyan] Moverse · "
+        "[cyan]escribe[/cyan] para filtrar · [cyan]<ESPACIO>[/cyan] Seleccionar/Desmarcar · "
+        "[cyan]<ctrl-a>[/cyan] Todos · [cyan]<ctrl-i>[/cyan] Invertir · [cyan]<ENTER>[/cyan] Instalar\n"
+    )
+
+    selected = questionary.checkbox(
+        "Selecciona las skills que deseas sincronizar/instalar en tu proyecto:",
+        choices=choices,
+        style=QUESTIONARY_STYLE,
+        instruction="",
+        use_search_filter=True,  # escribir filtra por nombre/descripción
+        use_jk_keys=False,       # incompatible con search filter (j/k son texto)
+    ).ask()
+
+    return selected or []
+
+
+# -----------------------------------------------------------------------------
+# Punto de entrada principal (CLI)
+# -----------------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Instala skills desde ~/Documents/Skills hacia .agents/skills en el proyecto actual.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos de uso:
+  skill-installer                     # Menú interactivo con toggle (espacio/enter)
+  skill-installer --list              # Ver catálogo de skills disponibles
+  skill-installer --all               # Instalar todas las skills disponibles
+  skill-installer --source ~/mi/ruta  # Usar otro almacén de skills
+        """
+    )
+    parser.add_argument(
+        "--source",
+        type=Path,
+        default=DEFAULT_SOURCE_DIR,
+        help="Ruta a la carpeta de skills global (por defecto: ~/Documents/Skills)",
+    )
+    parser.add_argument(
+        "--dest",
+        type=Path,
+        default=Path.cwd() / ".agents" / "skills",
+        help="Ruta de destino en el proyecto (por defecto: .agents/skills/ en el directorio actual)",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="Listar las skills disponibles en una tabla bonita y salir.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Instalar todas las skills disponibles automáticamente sin preguntar.",
+    )
+
+    args = parser.parse_args()
+
+    source_dir: Path = resolve_path(args.source)
+    target_dir: Path = resolve_path(args.dest)
+
+    # Validar directorio origen
+    if not source_dir.exists():
+        console.print(
+            Panel(
+                Text.from_markup(
+                    f"[bold red]✘ Directorio global de skills no encontrado:[/bold red]\n"
+                    f"[yellow]{source_dir}[/yellow]\n\n"
+                    f"Asegúrate de que la carpeta exista y contenga tus carpetas de skill.\n"
+                    f"[dim]Ruta por defecto: ~/Documents/Skills · puedes cambiarla con --source[/dim]"
+                ),
+                box=box.ROUNDED,
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    # Cargar skills
+    skills = load_skills(source_dir, target_dir)
+
+    if not skills:
+        console.print(
+            Panel(
+                Text.from_markup(
+                    f"[yellow]⚠ No se encontraron carpetas de skills en:[/yellow]\n"
+                    f"[cyan]{source_dir}[/cyan]\n\n"
+                    f"Copia tus carpetas de skill dentro de esa ruta e inténtalo de nuevo."
+                ),
+                box=box.ROUNDED,
+                border_style="yellow",
+            )
+        )
+        sys.exit(0)
+
+    installed_count = sum(1 for s in skills if s.is_installed)
+
+    # Modo --list
+    if args.list:
+        render_header(source_dir, target_dir, len(skills), installed_count)
+        show_skills_table(skills)
+        return
+
+    # Modo --all
+    if args.all:
+        render_header(source_dir, target_dir, len(skills), installed_count)
+        console.print(f"[bold cyan]Modo --all activado:[/bold cyan] Instalando las {len(skills)} skills disponibles...")
+        copy_skills(skills, target_dir)
+        return
+
+    # Modo interactivo (por defecto)
+    render_header(source_dir, target_dir, len(skills), installed_count)
+
+    try:
+        selected_skills = prompt_interactive_selection(skills)
+        if selected_skills is None:  # Usuario presionó Ctrl+C en prompt
+            console.print("\n[dim yellow]Operación cancelada.[/dim yellow]")
+            return
+        
+        copy_skills(selected_skills, target_dir)
+    except KeyboardInterrupt:
+        console.print("\n[dim yellow]Operación cancelada por el usuario (Ctrl+C).[/dim yellow]")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
